@@ -1,6 +1,8 @@
 # pi-termux-setup
 
-Конфигурация [Pi](https://github.com/earendil-works/pi-coding-agent) для Termux на Android: обёртка-супервизор, автовосстановление после падений, safety-слой для внешних действий и несколько расширений.
+Конфигурация [Pi](https://github.com/earendil-works/pi) для Termux на Android: обёртка-супервизор, автовосстановление после падений, safety-слой для внешних действий и несколько расширений.
+
+Устанавливаете впервые и нет ни Termux, ни Pi? → [пошаговая инструкция для Android](docs/install-android.md)
 
 Собрано под конкретное окружение — Pi 0.84.3, Termux на Android, aarch64. Часть решений специфична для Android: нет systemd, процессы убиваются системой, `/tmp` недоступен на запись. Если у вас Linux или macOS, отсюда полезны в основном расширения и safety-слой.
 
@@ -97,7 +99,9 @@ chmod +x ~/.pi/agent/resurrect/*.sh
 cp agent/settings.json.example ~/.pi/agent/settings.json
 ```
 
-В `settings.json.example` провайдер и модель заданы как заглушка — подставьте своё. Список `packages` ссылается на внешние пакеты (`pi-web-search`, `pi-quality-pack`, `pi-memory` и другие), которых в этом репозитории нет; уберите ненужные строки, иначе Pi не запустится.
+В `settings.json.example` провайдер и модель заданы как заглушка — подставьте своё. `packages` оставлен пустым: Pi не запустится, если в списке есть пакет, которого нет на диске.
+
+Подробная установка с нуля, включая Termux и Node.js: [docs/install-android.md](docs/install-android.md).
 
 Триггеры восстановления (опционально):
 

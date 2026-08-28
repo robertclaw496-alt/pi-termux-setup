@@ -3,15 +3,7 @@
   "defaultProvider": "anthropic",
   "defaultModel": "claude-sonnet-4",
   "defaultThinkingLevel": "high",
-  "packages": [
-    "../../pi-web-search",
-    "node_modules/pi-memory",
-    "node_modules/pi-observational-memory",
-    "git:github.com/kolt-mcb/pi-loop@v0.4.0",
-    "npm:@juicesharp/rpiv-todo",
-    "npm:pi-subagents@0.40.0",
-    "../../pi-quality-pack"
-  ],
+  "packages": [],
   "extensions": [],
   "observational-memory": {
     "observeAfterTokens": 10000,
