@@ -1,0 +1,20 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Protected default entrypoint for interactive Pi.
+# Administrative/read-only CLI commands bypass the supervisor deliberately.
+set -u
+REAL_PI="/data/data/com.termux/files/usr/bin/pi"
+PI_SAFE="/data/data/com.termux/files/home/.local/bin/pi-safe"
+
+case "${1-}" in
+  --version|-v|--help|-h|auth|update|install|remove|uninstall|list|config)
+    exec "$REAL_PI" "$@"
+    ;;
+esac
+
+# Explicit escape hatch for diagnostics/rollback without changing files.
+if [ "${PI_PROTECTED_DEFAULT_DISABLE-}" = "1" ]; then
+  exec "$REAL_PI" "$@"
+fi
+
+export PI_SAFE_PI="$REAL_PI"
+exec "$PI_SAFE" "$@"

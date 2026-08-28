@@ -1,0 +1,63 @@
+{
+  "theme": "dark",
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4",
+  "defaultThinkingLevel": "high",
+  "packages": [
+    "../../pi-web-search",
+    "node_modules/pi-memory",
+    "node_modules/pi-observational-memory",
+    "git:github.com/kolt-mcb/pi-loop@v0.4.0",
+    "npm:@juicesharp/rpiv-todo",
+    "npm:pi-subagents@0.40.0",
+    "../../pi-quality-pack"
+  ],
+  "extensions": [],
+  "observational-memory": {
+    "observeAfterTokens": 10000,
+    "reflectAfterTokens": 16000,
+    "compactAfterTokens": 81000,
+    "observationsPoolMaxTokens": 20000,
+    "observationsPoolTargetTokens": 10000,
+    "agentMaxTurns": 8,
+    "model": {
+      "provider": "mistral",
+      "id": "mistral-small-latest",
+      "thinking": "off"
+    },
+    "passive": false,
+    "debugLog": false
+  },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 5,
+    "baseDelayMs": 2000,
+    "provider": {
+      "maxRetries": 0,
+      "maxRetryDelayMs": 60000
+    }
+  },
+  "defaultProjectTrust": "always",
+  "subagents": {
+    "defaultThinking": "medium",
+    "defaultExtensions": [],
+    "projectRootResolution": "git-root",
+    "watchdog": {
+      "enabled": false,
+      "scope": {
+        "enabled": true
+      },
+      "autoFollow": {
+        "blockers": true,
+        "maxAttempts": 2,
+        "stalemateRepeats": 2
+      },
+      "lsp": {
+        "enabled": true,
+        "timeoutMs": 15000,
+        "maxFiles": 20,
+        "maxDiagnostics": 50
+      }
+    }
+  }
+}

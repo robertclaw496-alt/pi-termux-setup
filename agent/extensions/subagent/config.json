@@ -1,0 +1,24 @@
+{
+  "toolDescriptionMode": "compact",
+  "asyncByDefault": false,
+  "forceTopLevelAsync": false,
+  "fleetView": true,
+  "waitTool": {
+    "enabled": true
+  },
+  "parallel": {
+    "maxTasks": 4,
+    "concurrency": 2
+  },
+  "globalConcurrencyLimit": 2,
+  "maxSubagentDepth": 1,
+  "maxSubagentSpawnsPerSession": 0,
+  "artifactDir": "session",
+  "scheduledRuns": {
+    "enabled": false
+  },
+  "intercomBridge": {
+    "mode": "always",
+    "resultDelivery": true
+  }
+}

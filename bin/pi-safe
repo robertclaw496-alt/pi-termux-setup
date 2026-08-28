@@ -1,0 +1,432 @@
+#!/data/data/com.termux/files/usr/bin/node
+import { spawn, execFileSync } from "node:child_process";
+import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { openSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+
+const HOME = process.env.HOME || "/data/data/com.termux/files/home";
+const PI_DIR = process.env.PI_CODING_AGENT_DIR || join(HOME, ".pi", "agent");
+const RUNTIME = join(PI_DIR, "runtime");
+const LOCK = join(RUNTIME, "interactive-supervisor.lock");
+const STATE = join(RUNTIME, "interactive-supervisor.json");
+const CRASHES = join(RUNTIME, "crashes.jsonl");
+const LAST_SESSION = join(RUNTIME, "last-session");
+const LAST_EXIT = join(RUNTIME, "last-exit");
+const MAX_TOTAL = Number(process.env.PI_SAFE_MAX_TOTAL || 5);
+const MAX_SAME = Number(process.env.PI_SAFE_MAX_SAME || 3);
+const WINDOW_MS = 10 * 60 * 1000;
+const BACKOFF_BASE_MS = Number(process.env.PI_SAFE_BACKOFF_BASE_MS || 1000);
+const BACKOFF_MAX_MS = Number(process.env.PI_SAFE_BACKOFF_MAX_MS || 30000);
+// Resolve the real Pi CLI directly so a protected `pi` wrapper cannot recurse.
+const PI_BIN = process.env.PI_SAFE_PI || "/data/data/com.termux/files/usr/bin/pi";
+const SCRIPT_BIN = process.env.PI_SAFE_SCRIPT || "script";
+
+const now = () => new Date().toISOString();
+
+// PTY-лог дочернего Pi растёт всю сессию (наблюдалось >160 МБ за часы работы).
+// Разбор краха всё равно оставляет только последние килобайты (см. redact/safeStack),
+// поэтому читаем ограниченный хвост: пик RSS не должен зависеть от длины сессии,
+// особенно когда Android уже убивает процессы из-за нехватки памяти.
+export const CHILD_LOG_TAIL_BYTES = Number(process.env.PI_SAFE_CHILD_LOG_TAIL_BYTES || 256 * 1024);
+export async function tailFile(path, maxBytes = CHILD_LOG_TAIL_BYTES) {
+  let fh;
+  try {
+    fh = await open(path, "r");
+    const { size } = await fh.stat();
+    const length = Math.min(size, Math.max(0, maxBytes));
+    if (length === 0) return "";
+    const buf = Buffer.allocUnsafe(length);
+    await fh.read(buf, 0, length, size - length);
+    return buf.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
+// Recovery-continuation primitive (общий для pi-safe и pi-resurrect).
+// Модуль сам определяет runtime из PI_CODING_AGENT_DIR/PI_RECOVERY_RUNTIME,
+// поэтому в sandbox-тестах использует изолированное состояние автоматически.
+let recoveryApi = null;
+try {
+  recoveryApi = await import(`file://${HOME}/.pi/agent/recovery/recovery-continuation.mjs`);
+} catch (e) {
+  console.error(`pi-safe: recovery-continuation module unavailable: ${e.message}`);
+}
+
+// Безопасная сводка journal: только счётчики, без содержимого операций.
+async function actionSafetySummary(sessionId) {
+  const dir = join(PI_DIR, "action-safety", "operations");
+  const summary = { journalComplete: 0, journalStart: 0, journalUnknown: 0 };
+  if (!sessionId) return summary;
+  try {
+    for (const name of await readdir(dir)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const op = JSON.parse(await readFile(join(dir, name), "utf8"));
+        if (!op || op.session_id !== sessionId) continue;
+        if (op.status === "COMPLETED") summary.journalComplete++;
+        else if (op.status === "STARTED") summary.journalStart++;
+        else if (op.status === "UNKNOWN") summary.journalUnknown++;
+      } catch {}
+    }
+  } catch {}
+  return summary;
+}
+const safeText = (value, max = 4000) => String(value ?? "").replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "").slice(-max);
+const redact = (value) => safeText(value, 12000)
+  .replace(/(authorization\s*:\s*bearer\s+)[^\s\n]+/gi, "$1[REDACTED]")
+  .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
+  .replace(/((?:api[_-]?key|token|secret|password|cookie)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+  .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+  .replace(/(https?:\/\/[^\s/?]+\/[^\s]*[?&](?:key|token|secret|password)=[^\s&]+)/gi, "[REDACTED_URL]");
+const jsonWrite = async (path, value) => {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  await rename(tmp, path);
+};
+const readJson = async (path, fallback = null) => { try { return JSON.parse(await readFile(path, "utf8")); } catch { return fallback; } };
+const pidAlive = (pid) => {
+  const n = Number(pid); if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    const procStat = readFileSync(`/proc/${n}/stat`, "utf8");
+    const close = procStat.lastIndexOf(")"); const state = procStat.slice(close + 2).split(" ")[0];
+    if (state === "Z") return false;
+  } catch {}
+  try { process.kill(n, 0); return true; } catch { return false; }
+};
+const run = (cmd, args) => { try { return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 }); } catch { return ""; } };
+function processEnvFlag(pid, name) {
+  try {
+    return readFileSync(`/proc/${Number(pid)}/environ`, "utf8").split("\0").includes(`${name}=1`);
+  } catch { return false; }
+}
+
+function classify({ code, signal, stderr, wrapperSignal = null, previousLoss = false }) {
+  if (wrapperSignal === "SIGINT" || signal === "SIGINT" || code === 130) return "USER CTRL-C / explicit exit";
+  if (wrapperSignal === "SIGTERM" || signal === "SIGTERM" || code === 143) return "SIGTERM";
+  if (signal === "SIGKILL" || code === 137) return "SIGKILL";
+  if (code === 0) return "NORMAL EXIT";
+  if (previousLoss) return "ANDROID/TERMUX PROCESS LOSS";
+  if (/uncaughtException[\s\S]{0,500}Error:\s*write EPIPE|Error:\s*write EPIPE|code:\s*EPIPE|syscall:\s*write[\s\S]{0,100}EPIPE/i.test(stderr)) return "EPIPE";
+  // A clean Pi process exit caused by an upstream/provider response is not a Pi
+  // process crash. Retrying it in a detached resurrection loop only burns quota
+  // and keeps the singleton lock, making a manual `pi` launch fail with exit 75.
+  if (code != null && /(?:(?:^|\s)(?:4\d\d|5\d\d):\s*\{|daily_free_credits_exhausted|rate[ _-]?limit|quota[^\n]*(?:exhaust|exceed)|(?:api|provider)[^\n]*(?:error|unavailable))/i.test(stderr)) return "PROVIDER/API ERROR";
+  if (code != null) return "PI CRASH";
+  return "UNKNOWN";
+}
+function shouldRestart(kind) { return ["EPIPE", "PI CRASH", "SIGKILL", "ANDROID/TERMUX PROCESS LOSS", "UNKNOWN"].includes(kind); }
+function fingerprint(kind, stderr) {
+  const relevant = redact(stderr).split("\n").filter(x => /EPIPE|uncaught|Error:|code:|signal|at\s/.test(x)).slice(-12).join("\n");
+  return createHash("sha256").update(`${kind}\n${relevant}`).digest("hex").slice(0, 16);
+}
+function sessionDirFor(cwd) {
+  const safePath = resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-");
+  return join(PI_DIR, "sessions", `--${safePath}--`);
+}
+async function newestSession(cwd, since = 0) {
+  const dir = sessionDirFor(cwd); let best = null;
+  try {
+    for (const name of await readdir(dir)) {
+      if (!name.endsWith(".jsonl")) continue;
+      const path = join(dir, name); const s = await stat(path);
+      if (s.mtimeMs >= since && (!best || s.mtimeMs > best.mtimeMs)) best = { path, mtimeMs: s.mtimeMs };
+    }
+  } catch {}
+  return best?.path;
+}
+async function sessionInfo(path) {
+  if (!path) return {};
+  try {
+    const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+    const header = JSON.parse(lines[0]); const tail = lines.slice(-30).map(x => JSON.parse(x));
+    const last = tail.at(-1); const msg = last?.message;
+    const phase = last?.type === "compaction" ? "compaction" : msg?.role === "toolResult" ? `tool:${msg.toolName || "unknown"}` : last?.type || "idle";
+    return { sessionFile: path, sessionId: header.id, phase, lastEntryType: last?.type, lastTool: msg?.toolName, compactionActive: tail.some(x => x.type === "compaction"), subagentActive: tail.some(x => x.message?.toolName === "subagent" || /subagent/i.test(JSON.stringify(x.message?.content || ""))), extensionActive: tail.some(x => x.type === "custom" || x.type === "custom_message") };
+  } catch { return { sessionFile: path }; }
+}
+function safeStack(stderr) {
+  return redact(stderr).split("\n").filter(line => /^(?:Error:|\s*(?:at\s|code:|syscall:|name:|errno:|uncaughtException|pi exiting))/i.test(line)).slice(-40).join("\n").slice(-6000);
+}
+function memory() {
+  const usage = process.memoryUsage();
+  let freeMemory;
+  try { freeMemory = readFileSync("/proc/meminfo", "utf8").split("\n").filter(x => /^(MemAvailable|MemFree|SwapFree):/.test(x)).join("; "); } catch {}
+  return { rss: usage.rss, heapUsed: usage.heapUsed, heapTotal: usage.heapTotal, external: usage.external, freeMemory };
+}
+function children() { return redact(run("ps", ["-o", "pid=,ppid=,stat=,comm=", "--ppid", String(process.pid)]).trim()).slice(0, 2000); }
+async function report({ kind, code, signal, stderr, session, runtimeEvent, startTime }) {
+  const report = { timestamp: now(), piVersion: safeText(run(PI_BIN, ["--version"]).trim(), 80), sessionId: session.sessionId, sessionFile: session.sessionFile, exitCode: code, signal: signal || null, classification: kind, exceptionClass: /EPIPE/i.test(stderr) ? "Error (EPIPE)" : /uncaughtException/i.test(stderr) ? "uncaughtException" : kind === "PI CRASH" ? "uncaught process exit" : null, sanitizedStack: safeStack(stderr), lastSafeRuntimeEvent: runtimeEvent, memoryUsage: memory(), freeMemory: memory().freeMemory, childProcesses: children(), compactionActive: Boolean(session.compactionActive), subagentActive: Boolean(session.subagentActive), extensionActive: Boolean(session.extensionActive), startedAt: startTime };
+  await appendFile(CRASHES, JSON.stringify(report) + "\n", { mode: 0o600 });
+  return report;
+}
+async function acquire() {
+  await mkdir(RUNTIME, { recursive: true, mode: 0o700 });
+  try { const fh = await open(LOCK, "wx", 0o600); await fh.writeFile(JSON.stringify({ pid: process.pid, startedAt: now() })); return fh; }
+  catch {
+    const old = await readJson(LOCK);
+    if (old?.pid && pidAlive(old.pid)) {
+      const manualTakeover = process.env.PI_RESURRECTED !== "1" && processEnvFlag(old.pid, "PI_RESURRECTED");
+      if (!manualTakeover) throw new Error(`pi-safe: another supervisor is active (pid ${old.pid})`);
+      console.error(`pi-safe: stopping background recovery (pid ${old.pid}) for manual launch.`);
+      try { process.kill(old.pid, "SIGTERM"); } catch {}
+      const deadline = Date.now() + 5000;
+      while (pidAlive(old.pid) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+      if (pidAlive(old.pid)) throw new Error(`pi-safe: background recovery did not stop (pid ${old.pid})`);
+    }
+    try { await unlink(LOCK); } catch {}
+    const fh = await open(LOCK, "wx", 0o600); await fh.writeFile(JSON.stringify({ pid: process.pid, startedAt: now() })); return fh;
+  }
+}
+function explicitSession(args) { const i = args.findIndex(x => x === "--session"); return i >= 0 ? args[i + 1] : null; }
+function hasContinue(args) { return args.includes("-c") || args.includes("--continue"); }
+const VALUE_FLAGS = new Set(["--provider", "--model", "--thinking", "--models", "--tools", "-t", "--exclude-tools", "-xt", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--system-prompt", "--append-system-prompt", "--tui-mode", "--name", "-n", "--session-dir", "-p", "--print"]);
+function restartArgs(args, session) {
+  const kept = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (["--session", "--session-id", "--fork", "-c", "--continue", "-r", "--resume", "--no-session"].includes(arg)) { if (["--session", "--session-id", "--fork"].includes(arg)) i++; continue; }
+    if (arg === "--") break;
+    if (!arg.startsWith("-")) continue;
+    kept.push(arg);
+    if (VALUE_FLAGS.has(arg) && args[i + 1] !== undefined) kept.push(args[++i]);
+  }
+  // Only attach --session when a real session exists. A bare `null` would be
+  // stringified by spawn() to "null" and pi would crash with `No session found`.
+  return session ? [...kept, "--session", session] : kept;
+}
+async function doctor() {
+  const checks = []; const check = (name, ok, detail = "") => checks.push({ name, status: ok ? "PASS" : "FAIL", detail });
+  await mkdir(RUNTIME, { recursive: true, mode: 0o700 });
+  const version = run(PI_BIN, ["--version"]).trim();
+  check("Pi binary", /^\d+\.\d+\.\d+$/.test(version), version || "not executable");
+  check("session directory", existsSync(join(PI_DIR, "sessions")), join(PI_DIR, "sessions"));
+  check("resume capability", Boolean(run(PI_BIN, ["--help"]).includes("--session")), "--session documented");
+  check("runtime directory", existsSync(RUNTIME), RUNTIME);
+  try { await mkdir(RUNTIME, { recursive: true, mode: 0o700 }); const t = join(RUNTIME, `.doctor-${process.pid}`); await writeFile(t, "ok", { mode: 0o600 }); await unlink(t); check("crash log writable", true); } catch (e) { check("crash log writable", false, e.message); }
+  const lock = await readJson(LOCK); check("supervisor singleton", !(lock?.pid && pidAlive(lock.pid)), lock?.pid ? `active pid ${lock.pid}` : "available");
+  check("PTY wrapper", Boolean(run(SCRIPT_BIN, ["--version"]).trim()), `${SCRIPT_BIN} available`);
+  check("wake-lock command", Boolean(run("sh", ["-lc", "command -v termux-wake-lock"]).trim()), "available; status cannot be queried without changing state");
+  check("Termux process environment", Boolean(process.env.PREFIX && process.env.TERMUX_VERSION), `PREFIX=${process.env.PREFIX || "missing"}; TERMUX_VERSION=${process.env.TERMUX_VERSION || "not exported"}`);
+  check("process state readable", Boolean(run("sh", ["-lc", "test -r /proc/self/status && echo yes"]).trim()), "/proc/self/status");
+  const duplicates = run("sh", ["-lc", "ps -eo comm= | awk '$1 == \"pi\" {n++} END {print n+0}'"]).trim(); check("duplicate Pi processes", Number(duplicates || 0) <= 1, `${duplicates || 0} interactive visible`);
+  const last = await readJson(LAST_EXIT); check("previous abnormal exit", !last || ["NORMAL EXIT", "USER CTRL-C / explicit exit", "SIGTERM"].includes(last.classification), last?.classification || "none");
+  check("recovery-continuation module", Boolean(recoveryApi), recoveryApi ? "loaded" : "unavailable");
+  if (recoveryApi) {
+    const cont = await recoveryApi.continuationStatus().catch(() => null);
+    check("continuation durable state", Boolean(cont), cont ? `${cont.status} gen=${cont.generation} attempt=${cont.attempt}` : "absent (never run)");
+    check("continuation blocked", !cont || cont.status !== "BLOCKED", cont?.status === "BLOCKED" ? `blocked (gen=${cont.generation})` : "clear");
+    check("last continuation session", !cont || cont.status === "BLOCKED" ? "-" : (cont.sessionId || "none"), "");
+    check("last continuation generation", !cont ? "-" : String(cont.generation), "");
+  }
+  console.log(JSON.stringify({ tool: "pi-safe", version: 1, checks }, null, 2));
+  process.exitCode = checks.some(x => x.status === "FAIL") ? 1 : 0;
+}
+
+// Супервизор запускается только как CLI. При import (тесты чистых функций)
+// модуль не должен брать lock и плодить процессы.
+const invokedAsCli = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try { return resolve(entry) === resolve(fileURLToPath(import.meta.url)); } catch { return false; }
+})();
+if (!invokedAsCli) {
+  // только экспорты: tailFile, CHILD_LOG_TAIL_BYTES и прочие helpers
+} else {
+
+const args = process.argv.slice(2);
+if (args[0] === "doctor") { await doctor(); process.exit(); }
+let lock;
+try { lock = await acquire(); } catch (e) { console.error(e.message); process.exitCode = 75; process.exit(); }
+async function sweepOrphanChildLogs(runtimeDir = RUNTIME, alive = pidAlive) {
+  // При внезапной смерти Termux-процесса pi-safe не успевает удалить
+  // child-<pid>.typescript, и логи мёртвых супервизоров накапливаются (видели 179 МБ).
+  // Удаляем только чужие и точно мёртвые — живой супервизор не трогаем.
+  const removed = [];
+  try {
+    for (const name of await readdir(runtimeDir)) {
+      const m = /^child-(\d+)\.typescript$/.exec(name);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid || alive(pid)) continue;
+      try { await unlink(join(runtimeDir, name)); removed.push(name); } catch {}
+    }
+  } catch {}
+  return removed;
+}
+
+const start = now(); const cwd = process.cwd(); let previous = await readJson(STATE); const previousExit = await readJson(LAST_EXIT); const previousSession = await readJson(LAST_SESSION); const explicit = explicitSession(args);
+await sweepOrphanChildLogs();
+let previousLoss = Boolean(previous?.pid && !pidAlive(previous.pid) && previous?.status === "running");
+const previousAbnormal = previousExit && shouldRestart(previousExit.classification);
+const automaticRecoveryLaunch = process.env.PI_RESURRECTED === "1";
+let session = explicit || (automaticRecoveryLaunch && previousLoss ? previous.sessionFile : null) || (automaticRecoveryLaunch && previousAbnormal ? (previous?.sessionFile || previousSession?.sessionFile || previousExit.sessionFile) : null);
+if (previousLoss) {
+  const lossInfo = await sessionInfo(session);
+  const loss = await report({ kind: "ANDROID/TERMUX PROCESS LOSS", code: null, signal: null, stderr: "", session: lossInfo, runtimeEvent: "supervisor_process_loss_detected", startTime: previous.startedAt || now() });
+  await jsonWrite(LAST_EXIT, { timestamp: loss.timestamp, classification: "ANDROID/TERMUX PROCESS LOSS", exitCode: null, signal: null, sessionFile: session || null, sessionId: lossInfo.sessionId || null });
+}
+if (!session && args.length === 0) session = await newestSession(cwd, 0);
+let launchArgs = args.length ? args : ["-c"];
+if (session && !explicit && !hasContinue(args)) launchArgs = restartArgs(args, session);
+
+// Стартовый recovery continuation: после abnormal loss/exit единственный
+// логический continuation для события (exactly-once через модуль).
+let contInfo = null;
+let contMode = false;
+let runSessionId = null;
+const initialInfo = session ? await sessionInfo(session) : {};
+runSessionId = initialInfo.sessionId || null;
+// Only Android/runit resurrection owns an initial automatic continuation.
+// A user typing `pi` must regain an interactive TUI even if the previous run
+// ended abnormally; otherwise a stale provider error can trap every manual
+// launch in the same headless retry path.
+if (automaticRecoveryLaunch && recoveryApi && session && (previousLoss || previousAbnormal)) {
+  const plan = await recoveryApi.planContinuation({
+    sessionId: runSessionId,
+    sessionFile: session,
+    kind: previousLoss ? "ANDROID/TERMUX PROCESS LOSS" : (previousExit?.classification || "UNKNOWN"),
+    fingerprint: null,
+  });
+  if (plan.decision === "ALLOW") {
+    contInfo = { generation: plan.generation, attempt: plan.attempt };
+  } else if (plan.decision === "BLOCKED") {
+    console.error(`pi-safe: recovery continuation BLOCKED for ${runSessionId}: ${plan.reason}`);
+    await jsonWrite(STATE, { version: 1, pid: process.pid, status: "stopped", stoppedAt: now(), classification: "CONTINUATION_BLOCKED", sessionFile: session || null });
+    await lock.close(); await unlink(LOCK).catch(() => {});
+    process.exitCode = 70; process.exit();
+  } else if (plan.decision === "WAIT") {
+    console.error("pi-safe: recovery continuation already running elsewhere; interactive resume instead.");
+  }
+}
+await jsonWrite(STATE, { version: 1, pid: process.pid, status: "running", startedAt: start, cwd, sessionFile: session || null, continuation: contInfo, lastSafeRuntimeEvent: "launcher_started" });
+let wrapperSignal = null; let child; let stderr = ""; let settled = false; let outputBroken = false;
+const handleParentOutputError = (error) => {
+  if (error?.code === "EPIPE") { outputBroken = true; return; }
+  process.nextTick(() => { throw error; });
+};
+process.stdout.on("error", handleParentOutputError);
+process.stderr.on("error", handleParentOutputError);
+for (let attempt = 0; ; attempt++) {
+  const childStart = Date.now(); stderr = ""; settled = false;
+  contMode = contInfo !== null && recoveryApi !== null;
+  let continuationSummary = {};
+  if (contMode) {
+    continuationSummary = await actionSafetySummary(runSessionId);
+    const sessionContext = await recoveryApi.sessionContextFrom(session).catch(() => []);
+    const prompt = recoveryApi.buildRecoveryPrompt({
+      sessionId: runSessionId, generation: contInfo.generation, attempt: contInfo.attempt, summary: continuationSummary, sessionContext,
+    });
+    launchArgs = ["--session", session, "-p", prompt];
+  } else {
+    launchArgs = restartArgs(args, session);
+  }
+  const childLogPath = join(RUNTIME, `child-${process.pid}.typescript`);
+  // Headless runs (continuation or piped stdin) direct-spawn the real Pi:
+  // Termux's `script` wrapper re-splits argv through /bin/sh, which corrupts
+  // multi-word prompts ("Step 1:", "Work in ..."). Interactive terminals keep
+  // the script+PTY path so the TUI behaves exactly as before.
+  const interactive = Boolean(process.stdin.isTTY);
+  let childOutput = "";
+  if (contMode || !interactive) {
+    child = spawn(PI_BIN, launchArgs, { cwd, env: { ...process.env, PI_SAFE_SUPERVISOR: "1", PI_RECOVERY_CONTINUATION: contMode ? "1" : undefined }, stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout?.on("data", d => { childOutput += d; if (childOutput.length > 120000) childOutput = childOutput.slice(-120000); if (!outputBroken) process.stdout.write(d); });
+    child.stderr?.on("data", d => { childOutput += d; if (childOutput.length > 120000) childOutput = childOutput.slice(-120000); if (!outputBroken) process.stderr.write(d); });
+    if (contMode) {
+      // Bounded continuation: одна попытка не может висеть вечно.
+      const killTimer = setTimeout(() => { try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} } }, recoveryApi.CONTINUATION_TIMEOUT_MS);
+      killTimer.unref?.();
+      child.once("close", () => clearTimeout(killTimer));
+    }
+  } else {
+    if (process.env.PI_SAFE_DEBUG_CMDLINE === "1") console.error(`[DBG] spawn: ${SCRIPT_BIN} -qef ${childLogPath} -- ${PI_BIN} ${launchArgs.map(a => JSON.stringify(a)).join(" ")}`);
+    child = spawn(SCRIPT_BIN, ["-qef", childLogPath, "--", PI_BIN, ...launchArgs], { cwd, env: { ...process.env, PI_SAFE_SUPERVISOR: "1" }, stdio: ["inherit", "inherit", "inherit"] });
+  }
+  if (contMode) {
+    try { await recoveryApi.beginContinuation({ generation: contInfo.generation, sessionId: runSessionId, childPid: child.pid, summary: continuationSummary }); } catch (e) { console.error(`pi-safe: beginContinuation failed: ${e.message}`); }
+  }
+  const sessionPoll = setInterval(async () => {
+    const discovered = await newestSession(cwd, childStart - 1000);
+    if (discovered && discovered !== session) {
+      session = discovered;
+      await jsonWrite(STATE, { ...(await readJson(STATE, {})), sessionFile: session, lastSafeRuntimeEvent: "session_discovered" });
+    }
+  }, 1000);
+  sessionPoll.unref();
+  child.on("error", e => { stderr += `\\nlauncher child error: ${e.stack || e}`; });
+  const forward = signal => { wrapperSignal = signal; try { child.kill(signal); } catch {} };
+  const onInt = () => forward("SIGINT"); const onTerm = () => forward("SIGTERM");
+  process.once("SIGINT", onInt); process.once("SIGTERM", onTerm);
+  const result = await new Promise(resolveResult => child.on("close", (code, signal) => resolveResult({ code, signal })));
+  process.off("SIGINT", onInt); process.off("SIGTERM", onTerm);
+  clearInterval(sessionPoll);
+  if (contMode || !interactive) { stderr += childOutput; } else { stderr += await tailFile(childLogPath); }
+  stderr = redact(stderr);
+  await unlink(childLogPath).catch(() => {});
+  const discovery = await newestSession(cwd, childStart - 1000); if (discovery) session = discovery;
+  const info = await sessionInfo(session); const kind = classify({ ...result, stderr, wrapperSignal, previousLoss });
+  if (info.sessionId) runSessionId = info.sessionId;
+  const observedSignal = result.signal || (result.code === 130 ? "SIGINT" : result.code === 143 ? "SIGTERM" : result.code === 137 ? "SIGKILL" : null);
+  const abnormal = shouldRestart(kind);
+  await jsonWrite(LAST_SESSION, session ? { sessionFile: session, sessionId: info.sessionId, updatedAt: now() } : { sessionFile: null, updatedAt: now() });
+  await jsonWrite(LAST_EXIT, { timestamp: now(), classification: kind, exitCode: result.code, signal: observedSignal, sessionFile: session || null, sessionId: info.sessionId || null });
+  if (!abnormal) {
+    if (contMode && recoveryApi) {
+      if (kind === "NORMAL EXIT") {
+        try { await recoveryApi.completeContinuation({ generation: contInfo.generation, sessionId: runSessionId, exitCode: result.code, signal: observedSignal }); } catch (e) { console.error(`pi-safe: completeContinuation failed: ${e.message}`); }
+      } else {
+        try { await recoveryApi.failContinuation({ generation: contInfo.generation, sessionId: runSessionId, exitCode: result.code, signal: observedSignal, kind }).catch?.(() => {}); } catch {}
+      }
+    }
+    await jsonWrite(STATE, { version: 1, pid: process.pid, status: "stopped", stoppedAt: now(), classification: kind, sessionFile: session || null, continuation: contMode ? { generation: contInfo?.generation, attempt: contInfo?.attempt } : null });
+    await lock.close(); await unlink(LOCK).catch(() => {});
+    process.exitCode = result.code ?? (result.signal ? 128 : 1);
+    break;
+  }
+  const fp = fingerprint(kind, stderr); const history = (previous?.crashes || []).filter(x => Date.now() - Date.parse(x.timestamp) < WINDOW_MS); const same = history.filter(x => x.fingerprint === fp).length + 1; const total = history.length + 1;
+  const runtimeEvent = kind === "EPIPE" ? "pi_uncaught_EPIPE" : `pi_exit_${kind}`;
+  const crash = await report({ kind, code: result.code, signal: observedSignal, stderr, session: info, runtimeEvent, startTime: start });
+  const next = { version: 1, pid: process.pid, status: "crash", crashedAt: now(), classification: kind, fingerprint: fp, crashes: [...history, { timestamp: crash.timestamp, classification: kind, fingerprint: fp }], sessionFile: session || null, continuation: contInfo ? { generation: contInfo.generation, attempt: contInfo.attempt } : null, lastSafeRuntimeEvent: runtimeEvent };
+  await jsonWrite(STATE, next);
+  if ((!contMode && (total >= MAX_TOTAL || same >= MAX_SAME)) || !session) {
+    console.error(`pi-safe: stopping after ${total} crash(es), ${same} with the same fingerprint.`);
+    console.error(`root classification: ${kind}`);
+    console.error(crash.sanitizedStack || "(no sanitized stack available)");
+    await lock.close(); await unlink(LOCK).catch(() => {}); process.exitCode = result.code ?? 1; break;
+  }
+  // Continuation lifecycle для abnormal исходов:
+  //   - crash во время continuation -> fail (+retry или BLOCKED)
+  //   - первичный abnormal -> plan и запуск continuation на следующей итерации
+  if (contMode && recoveryApi) {
+    const fail = await recoveryApi.failContinuation({ generation: contInfo.generation, sessionId: runSessionId, exitCode: result.code, signal: observedSignal, kind }).catch(() => ({ decision: "ALLOW" }));
+    if (fail.decision === "BLOCKED") {
+      console.error(`pi-safe: recovery continuation BLOCKED after attempt ${fail.attempt} (${kind}); stopping supervisor.`);
+      await jsonWrite(STATE, { ...next, status: "stopped", stoppedAt: now(), classification: kind, continuation: { generation: contInfo.generation, attempts: fail.attempt, blocked: true } });
+      await lock.close(); await unlink(LOCK).catch(() => {}); process.exitCode = result.code ?? 1; break;
+    }
+    const retry = await recoveryApi.retryContinuation({ generation: contInfo.generation, sessionId: runSessionId }).catch(() => ({ decision: "NONE" }));
+    if (retry.decision !== "ALLOW") {
+      console.error(`pi-safe: cannot schedule recovery continuation retry (${retry.reason || retry.decision}); stopping supervisor.`);
+      await jsonWrite(STATE, { ...next, status: "stopped", stoppedAt: now(), classification: kind, continuation: { generation: contInfo.generation, attempts: fail.attempt } });
+      await lock.close(); await unlink(LOCK).catch(() => {}); process.exitCode = result.code ?? 1; break;
+    }
+    contInfo = { generation: retry.generation, attempt: retry.attempt };
+  } else if (recoveryApi && !contMode) {
+    const plan = await recoveryApi.planContinuation({ sessionId: runSessionId, sessionFile: session, kind, fingerprint: fp }).catch(() => null);
+    if (plan?.decision === "ALLOW") contInfo = { generation: plan.generation, attempt: plan.attempt };
+  }
+  const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** Math.min(total - 1, 5));
+  console.error(`pi-safe: ${kind}; resuming ${session} in ${delay} ms (attempt ${total}/${MAX_TOTAL})`);
+  await new Promise(r => setTimeout(r, delay));
+  await jsonWrite(STATE, { ...next, status: "running", restartedAt: now(), lastSafeRuntimeEvent: "restart_started" });
+  launchArgs = restartArgs(args, session); wrapperSignal = null; previousLoss = false;
+  const latest = await readJson(STATE, {}); latest.crashes = next.crashes; previous = latest;
+}
+
+} // end invokedAsCli

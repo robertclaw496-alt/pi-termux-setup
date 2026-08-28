@@ -1,0 +1,12 @@
+node_modules/
+*.log
+*.lock
+operations/
+sessions/
+runtime/
+state/
+auth.json
+models.json
+settings.json
+secrets/
+.env
